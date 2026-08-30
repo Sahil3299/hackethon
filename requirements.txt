@@ -1,0 +1,17 @@
+pandas 
+numpy 
+scikit-learn 
+xgboost 
+shap 
+chromadb 
+sentence-transformers 
+tabulate
+streamlit 
+langchain 
+langchain-google-genai
+langchain-core 
+pydantic
+python-dotenv
+fastapi
+uvicorn
+python-multipart 
