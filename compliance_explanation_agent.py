@@ -5,8 +5,12 @@ from pydantic import BaseModel
 
 from dotenv import load_dotenv
 
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_google_genai import ChatGoogleGenerativeAI
+try:
+    from langchain_core.prompts import ChatPromptTemplate
+    from langchain_google_genai import ChatGoogleGenerativeAI
+except ImportError:  # pragma: no cover - optional for light deploys
+    ChatPromptTemplate = None
+    ChatGoogleGenerativeAI = None
 
 
 # =============================================================================
@@ -24,17 +28,14 @@ api_key = (
     os.getenv("GOOGLE_API_KEY")
 )
 
-if not api_key:
-
-    raise EnvironmentError(
-        "GEMINI_API_KEY or GOOGLE_API_KEY not found."
+if api_key and ChatGoogleGenerativeAI is not None:
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash",
+        temperature=0.1,
+        google_api_key=api_key,
     )
-
-llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
-    temperature=0.1,
-    google_api_key=api_key
-)
+else:
+    llm = None
 
 
 # =============================================================================
@@ -59,6 +60,13 @@ class ComplianceExplanationResult(BaseModel):
 class ComplianceExplanationAgentLLM:
 
     def __init__(self, model=llm):
+
+        self.structured_llm = None
+        self.prompt = None
+        self.chain = None
+
+        if model is None or ChatPromptTemplate is None:
+            return
 
         self.structured_llm = (
             model.with_structured_output(
@@ -296,6 +304,11 @@ Generate a concise customer-friendly explanation.
         # ---------------------------------------------------------------------
         # GEMINI
         # ---------------------------------------------------------------------
+
+        if self.chain is None:
+            raise RuntimeError(
+                "Gemini LLM is not configured. Set GEMINI_API_KEY or GOOGLE_API_KEY in the Render environment."
+            )
 
         return self.chain.invoke({
 

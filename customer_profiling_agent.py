@@ -5,8 +5,12 @@ from typing import Dict, Any
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_google_genai import ChatGoogleGenerativeAI
+try:
+    from langchain_core.prompts import ChatPromptTemplate
+    from langchain_google_genai import ChatGoogleGenerativeAI
+except ImportError:  # pragma: no cover - optional for light deploys
+    ChatPromptTemplate = None
+    ChatGoogleGenerativeAI = None
 
 
 # =============================================================================
@@ -20,16 +24,14 @@ load_dotenv(ENV_FILE)
 
 api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 
-if not api_key:
-    raise EnvironmentError(
-        "GEMINI_API_KEY or GOOGLE_API_KEY not found in .env"
+if api_key and ChatGoogleGenerativeAI is not None:
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash",
+        temperature=0.1,
+        google_api_key=api_key,
     )
-
-llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
-    temperature=0.1,
-    google_api_key=api_key
-)
+else:
+    llm = None
 
 
 # =============================================================================
@@ -89,6 +91,13 @@ class CustomerProfilingAgentLLM:
 
     def __init__(self, model=llm):
 
+        self.structured_llm = None
+        self.prompt = None
+        self.chain = None
+
+        if model is None or ChatPromptTemplate is None:
+            return
+
         self.structured_llm = model.with_structured_output(
             ExtractedProfile
         )
@@ -130,6 +139,11 @@ Extract the borrower profile from:
 
         if isinstance(raw_input, dict):
             return ExtractedProfile(**raw_input)
+
+        if self.chain is None:
+            raise RuntimeError(
+                "Gemini LLM is not configured. Set GEMINI_API_KEY or GOOGLE_API_KEY in the Render environment."
+            )
 
         return self.chain.invoke({
             "user_input": raw_input
