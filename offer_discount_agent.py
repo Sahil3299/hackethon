@@ -1,8 +1,6 @@
-from typing import List
+from typing import Any, List
 
 from pydantic import BaseModel, Field
-
-from policy_rag_agent import PolicyRAGAgent
 
 
 # =============================================================================
@@ -35,7 +33,7 @@ class OfferDiscountAgentLLM:
 
     def __init__(
         self,
-        rag_agent: PolicyRAGAgent,
+              rag_agent: Any,
         base_rate: float = 11.5
     ):
 

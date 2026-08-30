@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+pandas
+numpy
+xgboost
+shap
+langchain
+langchain-google-genai
+langchain-core
+pydantic
+python-dotenv
