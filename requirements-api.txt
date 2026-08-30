@@ -9,3 +9,4 @@ langchain-google-genai
 langchain-core
 pydantic
 python-dotenv
+chromadb
