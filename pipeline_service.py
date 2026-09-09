@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 from affordability_agent import AffordabilityAgent
 from compliance_explanation_agent import ComplianceExplanationAgentLLM
 from customer_profiling_agent import CustomerProfilingAgentLLM, ExtractedProfile
+from database import get_db
 from loan_simulator_agent import LoanSimulatorAgent
 from offer_discount_agent import OfferDiscountAgentLLM, PolicyEvaluationResult
 from policy_rag_agent import PolicyRAGAgent
@@ -29,7 +30,6 @@ FEATURE_LABELS = {
     "loan_amount": "Loan amount",
     "tenure_months": "Loan tenure",
     "foir": "Obligation ratio (FOIR)",
-    "gender_encoded": "Applicant profile attribute",
 }
 
 
@@ -43,6 +43,96 @@ class LoanPipelineService:
         self.simulator = LoanSimulatorAgent()
         self.compliance = ComplianceExplanationAgentLLM()
         self.applications: Dict[str, Dict[str, Any]] = {}
+
+    # ------------------------------------------------------------------
+    # Persistence helpers. Fall back to the in-memory dict when Supabase
+    # is not configured so the app still runs locally.
+    # ------------------------------------------------------------------
+    def _db(self):
+        return get_db()
+
+    def _own_applications(self, user_id: str) -> List[Dict[str, Any]]:
+        """Load application summary rows visible to a user."""
+        db = self._db()
+        if db is None:
+            return [
+                r for r in self.applications.values()
+                if r.get("user_id") == user_id or not r.get("user_id")
+            ]
+        try:
+            resp = db.from_("applications").select("*").eq("user_id", user_id).order("created_at", desc=True).execute()
+            return resp.data or []
+        except Exception as exc:
+            _ = exc
+            return []
+
+    def _all_applications(self) -> List[Dict[str, Any]]:
+        """Load all application rows (loan-officer scope)."""
+        db = self._db()
+        if db is None:
+            return list(self.applications.values())
+        try:
+            resp = db.from_("applications").select("*").order("created_at", desc=True).execute()
+            return resp.data or []
+        except Exception as exc:
+            _ = exc
+            return []
+
+    def _get_application_record(self, application_id: str) -> Optional[Dict[str, Any]]:
+        db = self._db()
+        if db is None:
+            return self.applications.get(application_id)
+        try:
+            resp = db.from_("applications").select("*").eq("application_id", application_id).limit(1).execute()
+            rows = resp.data or []
+            if not rows:
+                return None
+            row = rows[0]
+            record = dict(row.get("record") or {})
+            record["application_id"] = record.get("application_id") or application_id
+            record["user_id"] = row.get("user_id")
+            record["status"] = row.get("status")
+            record["company_status"] = row.get("status")
+            record["human_review_required"] = row.get("human_review_required", False)
+            if row.get("decision_note"):
+                record["decision_note"] = row.get("decision_note")
+            return record
+        except Exception as exc:
+            _ = exc
+            return self.applications.get(application_id)
+
+    def _save_application(
+        self,
+        record: Dict[str, Any],
+        user_id: Optional[str] = None,
+        status: str = "PENDING_REVIEW",
+        human_review_required: Optional[bool] = None,
+    ) -> None:
+        db = self._db()
+        application_id = record["application_id"]
+        record["user_id"] = user_id
+        record["status"] = status
+        self.applications[application_id] = dict(record)
+        if db is None:
+            return
+        review = (human_review_required
+                  if human_review_required is not None
+                  else bool((record.get("trust") or {}).get("human_review_required")))
+        payload = {
+            "application_id": application_id,
+            "user_id": user_id,
+            "status": status,
+            "human_review_required": review,
+            "record": record,
+        }
+        try:
+            existing = db.from_("applications").select("application_id").eq("application_id", application_id).limit(1).execute()
+            if existing.data:
+                db.from_("applications").update(payload).eq("application_id", application_id).execute()
+            else:
+                db.from_("applications").insert(payload).execute()
+        except Exception as exc:
+            _ = exc
 
     def create_profile(self, payload: Dict[str, Any]) -> ExtractedProfile:
         agent_input = {
@@ -62,6 +152,8 @@ class LoanPipelineService:
         self,
         payload: Dict[str, Any],
         include_explanation: bool = True,
+        user_id: Optional[str] = None,
+        status: str = "PENDING_REVIEW",
     ) -> Dict[str, Any]:
         profile = self.create_profile(payload)
         aff = self.affordability.assess(profile)
@@ -115,14 +207,15 @@ class LoanPipelineService:
             risk=risk,
             explanation=explanation,
             explanation_error=explanation_error,
+            status=status,
         )
-        self.applications[application_id] = record
+        self._save_application(record, user_id=user_id, status=status)
         return record
 
     def simulate(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Re-run EMI, FOIR, risk, and early-closure using existing agents."""
         application_id = payload.get("application_id")
-        base = self.applications.get(application_id) if application_id else None
+        base = self._get_application_record(application_id) if application_id else None
 
         if application_id and not base:
             raise KeyError(f"Application not found: {application_id}")
@@ -222,26 +315,95 @@ class LoanPipelineService:
             },
         }
 
-    def list_applications(self) -> List[Dict[str, Any]]:
+    def list_applications(self, user_id: Optional[str] = None, officer: bool = False) -> List[Dict[str, Any]]:
+        if officer:
+            rows_source = self._all_applications()
+        elif user_id:
+            rows_source = self._own_applications(user_id)
+        else:
+            rows_source = self._all_applications()
+
         rows = []
-        for record in self.applications.values():
-            rows.append({
-                "application_id": record["application_id"],
-                "display_name": record["officer_fields"].get("full_name") or record["application_id"],
-                "requested_loan": record["profile"]["requested_loan"],
-                "recommended_loan": record["affordability"]["adjusted_loan"],
-                "decision_type": record["affordability"]["decision_type"],
-                "is_eligible": record["affordability"]["is_eligible"],
-                "foir_percent": record["foir_breakdown"]["committed_percent"],
-                "policy_fit_score": record["policy_fit"]["score"],
-                "risk_band": record["risk"]["risk_band"],
-                "created_at": record["created_at"],
-            })
-        rows.sort(key=lambda item: item["created_at"], reverse=True)
+        for item in rows_source:
+            if isinstance(item, dict) and "record" in item and isinstance(item.get("record"), dict):
+                record = item["record"]
+                record.setdefault("application_id", item.get("application_id"))
+                rows.append(self._summary_from(record, item))
+            else:
+                record = item
+                rows.append(self._summary_from(record))
+        rows.sort(key=lambda item: item.get("created_at", "") or "", reverse=True)
         return rows
 
+    def _summary_from(self, record: Dict[str, Any], row: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        return {
+            "application_id": record.get("application_id") or (row or {}).get("application_id"),
+            "display_name": (record.get("officer_fields") or {}).get("full_name")
+                            or (record.get("application_id") or ""),
+            "requested_loan": (record.get("profile") or {}).get("requested_loan"),
+            "recommended_loan": (record.get("affordability") or {}).get("adjusted_loan"),
+            "decision_type": (record.get("affordability") or {}).get("decision_type"),
+            "is_eligible": (record.get("affordability") or {}).get("is_eligible"),
+            "foir_percent": ((record.get("foir_breakdown") or {}).get("committed_percent")),
+            "policy_fit_score": (record.get("policy_fit") or {}).get("score"),
+            "risk_band": (record.get("risk") or {}).get("risk_band"),
+            "status": (row or {}).get("status") or record.get("status") or "PENDING_REVIEW",
+            "human_review_required": (row or {}).get("human_review_required",
+                                        (record.get("trust") or {}).get("human_review_required", False)),
+            "created_at": (row or {}).get("created_at") or record.get("created_at"),
+        }
+
     def get_application(self, application_id: str) -> Optional[Dict[str, Any]]:
-        return self.applications.get(application_id)
+        return self._get_application_record(application_id)
+
+    def make_decision(
+        self,
+        application_id: str,
+        decision: str,
+        note: Optional[str],
+        decided_by: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Record a loan-officer decision. Persists to Supabase when configured;
+        otherwise falls back to the in-memory cache so the app still runs
+        end to end in local dev.
+
+        Returns a summary dict, or None if the application does not exist.
+        """
+        db = self._db()
+        if db is not None:
+            resp = db.from_("applications").select("*").eq("application_id", application_id).limit(1).execute()
+            rows = resp.data or []
+            if not rows:
+                return None
+            existing = rows[0]
+            old_status = existing.get("status")
+            db.from_("applications").update({
+                "status": decision,
+                "decision_note": note or "",
+                "decision_by": decided_by,
+                "decided_at": "now()",
+            }).eq("application_id", application_id).execute()
+            return {
+                "application_id": application_id,
+                "previous_status": old_status,
+                "new_status": decision,
+            }
+
+        record = self.applications.get(application_id)
+        if not record:
+            return None
+        old_status = record.get("status") or "PENDING_REVIEW"
+        record["status"] = decision
+        record["decision_note"] = note or ""
+        record["decision_by"] = decided_by
+        record["decided_at"] = datetime.now(timezone.utc).isoformat()
+        self.applications[application_id] = dict(record)
+        return {
+            "application_id": application_id,
+            "previous_status": old_status,
+            "new_status": decision,
+        }
 
     def _assemble_record(
         self,
@@ -255,6 +417,7 @@ class LoanPipelineService:
         risk: Dict[str, Any],
         explanation: Optional[Dict[str, str]],
         explanation_error: Optional[str],
+        status: str = "PENDING_REVIEW",
     ) -> Dict[str, Any]:
         emi = float(sim.get("emi", aff.get("estimated_emi", 0.0)) or 0.0)
         foir_breakdown = self._foir_breakdown(
@@ -284,6 +447,7 @@ class LoanPipelineService:
         return {
             "application_id": application_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
+            "status": status,
             "illustrative_data": True,
             "officer_fields": {
                 "full_name": officer_fields.get("full_name"),

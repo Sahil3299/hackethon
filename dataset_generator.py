@@ -33,7 +33,6 @@ def generate_loan_dataset(n_samples=5000, seed=42):
         + 4.2 * (foir - 0.50)
         - 0.000015 * monthly_income
         + 0.025 * np.maximum(0, age - 50)
-        - 0.20 * (gender == 'Female')
         + np.random.normal(0, 0.4, size=n_samples)
     )
     prob_default = 1 / (1 + np.exp(-risk_logits))
